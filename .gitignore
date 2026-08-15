@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+# 环境变量与密钥（真实密钥绝不入库；.env.secret.temple 为模板、保留提交）
+.env
+.env.secret
+!.env.secret.temple
+
+# claude code
+.claude/
