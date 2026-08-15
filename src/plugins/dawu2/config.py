@@ -1,15 +1,46 @@
-import nonebot
+import json
 from pathlib import Path
+
+import nonebot
+
 from .keywords import KEYWORDS
 
 config = nonebot.get_driver().config
 
+
+def _parse_groups(raw) -> list[int]:
+    """解析群号配置，兼容 str / int / list 三种形态。
+
+    NoneBot 加载自定义配置时会先尝试 json.loads，导致：
+      - 单个群号（如 123456）被解析成 int
+      - JSON 数组（如 [123456, 654321]）被解析成 list
+      - 逗号分隔多个群号（如 123456,654321）保持 str
+    这里统一做类型归一，避免群组筛选失效。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, int):
+        return [raw]
+    if isinstance(raw, list):
+        return [int(x) for x in raw if str(x).strip().isdigit()]
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = raw
+        if isinstance(parsed, list):
+            return [int(x) for x in parsed if str(x).strip().isdigit()]
+        if isinstance(parsed, int):
+            return [parsed]
+        return [int(x) for x in str(parsed).split(",") if x.strip().isdigit()]
+    return []
+
+
 # 允许使用本插件的群聊列表，留空表示所有群聊都可以使用
-_raw = getattr(config, 'dawu2_allowed_groups', None)
-if isinstance(_raw, str) and _raw.strip():
-    ALLOWED_GROUPS = [int(g.strip()) for g in _raw.split(",") if g.strip().isdigit()]
-else:
-    ALLOWED_GROUPS = []
+ALLOWED_GROUPS = _parse_groups(getattr(config, 'dawu2_allowed_groups', None))
 
 def get_image_path(keyword: str) -> Path:
     return Path.cwd() / "src" / "asserts" / "dawu2" / f"{keyword}.jpg"
