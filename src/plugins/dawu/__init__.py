@@ -138,9 +138,20 @@ async def _(
                 f"正在尝试AI匹配...",
                 reply_message=True,
             )
-            ai_keywords = await ai_match(name.result, KEYWORDS)
+            ai_keywords, error = await ai_match(name.result, KEYWORDS)
 
-            if ai_keywords:
+            if error:
+                if error == "config":
+                    await dawu1.finish(
+                        "AI 匹配服务未配置，暂无法使用模糊匹配，请联系管理员",
+                        reply_message=True,
+                    )
+                else:
+                    await dawu1.finish(
+                        "AI 匹配服务暂时不可用，请稍后再试",
+                        reply_message=True,
+                    )
+            elif ai_keywords:
                 await send_keyword_images(ai_keywords, "AI匹配到： ")
             else:
                 await dawu1.finish(

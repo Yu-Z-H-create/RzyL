@@ -1,6 +1,8 @@
-import aiohttp
 import asyncio
+import json
 import logging
+
+import aiohttp
 import nonebot
 
 from .keywords import KEYWORDS
@@ -19,10 +21,31 @@ headers = {
 }
 
 AI_SEMAPHORE = asyncio.Semaphore(8)
+REQUEST_TIMEOUT = 60  # 秒
+
 logger = logging.getLogger(__name__)
 
+# 启动期配置校验：配置缺失尽早暴露，而不是每次查询失败才报
+if not BASE_URL:
+    logger.warning("AI 匹配配置缺失：BASE_URL 为空，AI 模糊匹配将不可用")
+if not API_KEY:
+    logger.warning("AI 匹配配置缺失：API_KEY 为空，AI 模糊匹配将不可用")
+if not MODEL_THINK:
+    logger.warning("AI 匹配配置缺失：MODEL_THINK 为空，AI 模糊匹配将不可用")
 
-async def ai_match(message: str, keywords: dict[str, list[str]]) -> list[str]:
+
+async def ai_match(message: str, keywords: dict[str, list[str]]) -> tuple[list[str], str | None]:
+    """AI 模糊匹配，返回 (关键词列表, 错误原因)。
+
+    错误原因为 None 表示流程正常完成（此时关键词列表可能为空，表示无匹配）；
+    非 None 表示发生错误，值为机器可读原因标识：
+      config / timeout / network / parse / http_<status> / unknown
+    """
+    # 配置不完整时快速失败，不发起请求
+    if not BASE_URL or not API_KEY or not MODEL_THINK:
+        logger.error("AI 匹配配置不完整，跳过请求（BASE_URL/API_KEY/MODEL_THINK 存在空值）")
+        return [], "config"
+
     keywords_list = []
     for keyword, aliases in keywords.items():
         aliases_str = ", ".join(aliases)
@@ -49,19 +72,37 @@ async def ai_match(message: str, keywords: dict[str, list[str]]) -> list[str]:
 
     try:
         async with AI_SEMAPHORE:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, headers=headers, json=data) as response:
+                    if response.status != 200:
+                        body = (await response.text())[:200]
+                        logger.error(f"AI 匹配 API 返回 HTTP {response.status}: {body}")
+                        return [], f"http_{response.status}"
+
                     response_json = await response.json()
-                    if response_json["choices"][0]["finish_reason"] == "stop":
-                        result = response_json["choices"][0]["message"]["content"].strip()
-                    else:
-                        result = "NONE"
+                    choice = response_json["choices"][0]
+
+                    if choice["finish_reason"] != "stop":
+                        logger.warning(f"AI 匹配 finish_reason={choice['finish_reason']!r}，视为无匹配")
+                        return [], None
+
+                    result = choice["message"]["content"].strip()
+    except asyncio.TimeoutError:
+        logger.error(f"AI 匹配请求超时（>{REQUEST_TIMEOUT}s）")
+        return [], "timeout"
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+        logger.error(f"AI 匹配响应解析失败: {type(e).__name__}: {e}")
+        return [], "parse"
+    except aiohttp.ClientError as e:
+        logger.error(f"AI 匹配网络错误: {e!r}")
+        return [], "network"
     except Exception as e:
-        logger.error(f"AI匹配请求失败: {e}")
-        return []
+        logger.error(f"AI 匹配未预期错误: {type(e).__name__}: {e}")
+        return [], "unknown"
 
     if result == "NONE":
-        return []
+        return [], None
 
     keywords_found = [k.strip() for k in result.split(",")]
-    return keywords_found
+    return keywords_found, None
