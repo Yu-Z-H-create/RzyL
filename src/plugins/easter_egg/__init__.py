@@ -84,19 +84,19 @@ def resolve_entity_image(entity: Entity) -> Path | None:
 
 
 def find_entities(text: str, entities: dict[str, Entity]) -> list[Entity]:
-    """按别名子串匹配，同一输入可命中多个个体。"""
+    """按别名直接相等匹配（而非子串包含），同一输入可命中多个个体。"""
     found: list[Entity] = []
     for entity in entities.values():
-        if any(alias in text for alias in entity.aliases):
+        if any(alias == text for alias in entity.aliases):
             found.append(entity)
     return found
 
 
 def find_compounds(text: str, compounds: dict[str, Compound], entities: dict[str, Entity]) -> list[tuple[str, list[Entity]]]:
-    """匹配复合体，返回 (compound_key, [可见的 target 个体])。"""
+    """按别名直接相等匹配复合体，返回 (compound_key, [可见的 target 个体])。"""
     found = []
     for key, compound in compounds.items():
-        if any(alias in text for alias in compound.aliases):
+        if any(alias == text for alias in compound.aliases):
             if compound_visible(compound, entities):
                 targets = [entities[t] for t in compound.targets if t in entities]
                 found.append((key, targets))
@@ -194,7 +194,7 @@ async def _(event: MessageEvent, name: Match[str]):
     if raw_text == "help":
         await caidan.finish(
             "使用方法: 彩蛋 <名称>\n例如: 彩蛋 玲娜贝儿 / 彩蛋 四大善人\n\n"
-            "- 精确匹配彩蛋名称（别名子串匹配），返回对应图片\n"
+            "- 精确匹配彩蛋名称（别名直接相等匹配），返回对应图片\n"
             "- 未精确匹配时，自动使用 AI 模糊匹配彩蛋\n"
             "- 若仍无匹配，会作为对话机器人回复你的发言\n"
             "- 发送「彩蛋 ls」查看所有可用彩蛋",
