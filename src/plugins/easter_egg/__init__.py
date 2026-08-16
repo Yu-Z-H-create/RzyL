@@ -1,10 +1,16 @@
+import logging
 import random
-from nonebot import require
-from nonebot.plugin import PluginMetadata
-from nonebot.adapters.onebot.v11 import Message, MessageSegment
+import time
+from collections import defaultdict
 from pathlib import Path
 
+from nonebot import require
+from nonebot.plugin import PluginMetadata
+from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
+
+from .ai_match import ai_chat, ai_match
 from .keywords import (
+    Compound,
     Entity,
     load_categories,
     load_entities,
@@ -16,6 +22,8 @@ from .random_text import load_random_text as try_load_random_text
 require("nonebot_plugin_alconna")
 
 from nonebot_plugin_alconna import Alconna, Args, Match, on_alconna
+
+logger = logging.getLogger(__name__)
 
 __plugin_meta__ = PluginMetadata(
     name="彩蛋插件",
@@ -84,7 +92,7 @@ def find_entities(text: str, entities: dict[str, Entity]) -> list[Entity]:
     return found
 
 
-def find_compounds(text: str, compounds: dict[str, "Compound"], entities: dict[str, Entity]) -> list[tuple[str, list[Entity]]]:
+def find_compounds(text: str, compounds: dict[str, Compound], entities: dict[str, Entity]) -> list[tuple[str, list[Entity]]]:
     """匹配复合体，返回 (compound_key, [可见的 target 个体])。"""
     found = []
     for key, compound in compounds.items():
@@ -93,6 +101,69 @@ def find_compounds(text: str, compounds: dict[str, "Compound"], entities: dict[s
                 targets = [entities[t] for t in compound.targets if t in entities]
                 found.append((key, targets))
     return found
+
+
+def build_ai_keywords(entities: dict[str, Entity], compounds: dict[str, Compound]) -> dict[str, list[str]]:
+    """把可见的个体与复合体整理成 AI 模糊匹配用的 {key: aliases} 字典。"""
+    keywords: dict[str, list[str]] = {}
+    for key, entity in entities.items():
+        keywords[key] = list(entity.aliases)
+    for key, compound in compounds.items():
+        if compound_visible(compound, entities):
+            keywords[key] = list(compound.aliases)
+    return keywords
+
+
+# AI 路径（模糊匹配 + 对话回退）会消耗 API 额度，按用户限流，与 dawu 保持一致
+RATE_LIMIT: defaultdict[int, list[float]] = defaultdict(list)
+MAX_REQUESTS_PER_MINUTE = 10
+
+
+def check_rate_limit(user_id: int) -> bool:
+    """检查并记录请求：裁剪 60 秒外的记录，未超限则记入当前时间戳并放行。"""
+    now = time.time()
+    user_requests = [t for t in RATE_LIMIT[user_id] if now - t < 60]
+    if len(user_requests) >= MAX_REQUESTS_PER_MINUTE:
+        RATE_LIMIT[user_id] = user_requests
+        return False
+    user_requests.append(now)
+    RATE_LIMIT[user_id] = user_requests
+    return True
+
+
+async def _append_entity_messages(entity: Entity, messages: list) -> None:
+    """解析单个个体的图片并追加到消息列表（缺失则追加提示）。"""
+    path = await _resolve_image_or_none(entity)
+    if path:
+        messages.append(f"{entity.aliases[0]}:")
+        messages.append(MessageSegment.image(path))
+    else:
+        messages.append(f"{entity.aliases[0]}: 图片文件不存在")
+
+
+async def send_ai_matched_images(ai_keys: list[str], entities: dict[str, Entity], compounds: dict[str, Compound]) -> None:
+    """根据 AI 返回的 key 列表解析并发出图片（个体或复合体），无可用图片时给出提示。"""
+    image_messages: list = []
+    seen: set[str] = set()
+    for key in ai_keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in entities:
+            await _append_entity_messages(entities[key], image_messages)
+        elif key in compounds and compound_visible(compounds[key], entities):
+            for target_key in compounds[key].targets:
+                if target_key in entities:
+                    await _append_entity_messages(entities[target_key], image_messages)
+
+    if not image_messages:
+        await caidan.finish("AI 匹配到关键词但未找到可用图片", reply_message=True)
+        return
+
+    messages: list = ["AI 匹配到：", *image_messages]
+    if random_text := try_load_random_text():
+        messages.append(random_text)
+    await caidan.finish(Message(messages))
 
 
 caidan = on_alconna(
@@ -107,7 +178,9 @@ async def _resolve_image_or_none(entity: Entity) -> Path | None:
 
 
 @caidan.handle()
-async def _(name: Match[str]):
+async def _(event: MessageEvent, name: Match[str]):
+    logger.info(f"收到彩蛋请求: 群{getattr(event, 'group_id', '私聊')}, 用户{event.user_id}, 内容{name.result}")
+
     if not name.available:
         await caidan.finish("请输入名称，例如: 彩蛋 玲娜贝儿")
         return
@@ -116,6 +189,18 @@ async def _(name: Match[str]):
 
     entities = load_entities()
     compounds = load_compounds()
+
+    # 彩蛋 help: 帮助信息
+    if raw_text == "help":
+        await caidan.finish(
+            "使用方法: 彩蛋 <名称>\n例如: 彩蛋 玲娜贝儿 / 彩蛋 四大善人\n\n"
+            "- 精确匹配彩蛋名称（别名子串匹配），返回对应图片\n"
+            "- 未精确匹配时，自动使用 AI 模糊匹配彩蛋\n"
+            "- 若仍无匹配，会作为对话机器人回复你的发言\n"
+            "- 发送「彩蛋 ls」查看所有可用彩蛋",
+            reply_message=True,
+        )
+        return
 
     # 彩蛋 ls: 按类分组列出所有可见彩蛋
     if raw_text == "ls":
@@ -157,30 +242,50 @@ async def _(name: Match[str]):
     # 个体匹配
     entity_matches = find_entities(raw_text, entities)
 
-    if not compound_matches and not entity_matches:
-        await caidan.finish(f"未找到匹配的彩蛋: {raw_text}")
+    # 精确匹配命中：直接出图
+    if compound_matches or entity_matches:
+        messages: list = []
+        for _, targets in compound_matches:
+            for target in targets:
+                await _append_entity_messages(target, messages)
+        for entity in entity_matches:
+            await _append_entity_messages(entity, messages)
+        if random_text := try_load_random_text():
+            messages.append(random_text)
+        await caidan.finish(Message(messages))
         return
 
-    messages = []
+    # 精确未命中：AI 模糊匹配（消耗 API 额度，按用户限流）
+    if not check_rate_limit(event.user_id):
+        await caidan.finish("请求过于频繁，请稍后再试（每分钟最多10次请求）")
+        return
 
-    for _, targets in compound_matches:
-        for target in targets:
-            path = await _resolve_image_or_none(target)
-            if path:
-                messages.append(f"{target.aliases[0]}:")
-                messages.append(MessageSegment.image(path))
-            else:
-                messages.append(f"{target.aliases[0]}: 图片文件不存在")
+    await caidan.send("正在思考...")
 
-    for entity in entity_matches:
-        path = await _resolve_image_or_none(entity)
-        if path:
-            messages.append(f"{entity.aliases[0]}:")
-            messages.append(MessageSegment.image(path))
+    ai_keywords = build_ai_keywords(entities, compounds)
+    ai_keys, error = await ai_match(raw_text, ai_keywords)
+
+    if error:
+        if error == "config":
+            await caidan.finish("AI 匹配服务未配置，暂无法使用模糊匹配，请联系管理员", reply_message=True)
         else:
-            messages.append(f"{entity.aliases[0]}: 图片文件不存在")
+            await caidan.finish("AI 匹配服务暂时不可用，请稍后再试", reply_message=True)
+        return
 
-    if random_text := try_load_random_text():
-        messages.append(random_text)
+    if ai_keys:
+        # AI 命中彩蛋关键词：出图
+        await send_ai_matched_images(ai_keys, entities, compounds)
+        return
 
-    await caidan.finish(Message(messages))
+    # AI 也未匹配（视为用户在「彩蛋」后说了无关/无意义的话）：对话回退，引用该用户的发言
+    reply, chat_error = await ai_chat(raw_text)
+    if chat_error:
+        if chat_error == "config":
+            await caidan.finish("对话服务未配置，暂无法使用", reply_message=True)
+        else:
+            await caidan.finish("对话服务暂时不可用，请稍后再试", reply_message=True)
+        return
+    if reply:
+        await caidan.finish(reply, reply_message=True)
+    else:
+        await caidan.finish("（没有想好要说什么）", reply_message=True)

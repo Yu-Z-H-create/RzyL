@@ -1,0 +1,152 @@
+import asyncio
+import json
+import logging
+
+import aiohttp
+import nonebot
+
+config = nonebot.get_driver().config
+
+# 配置默认值
+BASE_URL = getattr(config, "base_url", "")
+API_KEY = getattr(config, "api_key", "")
+MODEL_THINK = getattr(config, "model_think", "")  # 模糊匹配用
+MODEL_CHAT = getattr(config, "model_chat", "")    # 对话回退用
+
+# 对话模式预设系统提示词：可通过 EASTER_EGG_CHAT_PROMPT 覆盖，留空则使用内置默认值
+DEFAULT_CHAT_PROMPT = (
+    "你是一个被群友在「彩蛋」指令后随意召唤的 QQ 群聊机器人。"
+    "用户输入的话没有匹配到任何彩蛋，请你像群友一样自然、简短、带点幽默地回应，"
+    "不要长篇大论，不要自称助手。"
+)
+CHAT_SYSTEM_PROMPT = getattr(config, "easter_egg_chat_prompt", "") or DEFAULT_CHAT_PROMPT
+
+AI_SEMAPHORE = asyncio.Semaphore(8)
+REQUEST_TIMEOUT = 60  # 秒
+
+logger = logging.getLogger(__name__)
+
+# 启动期配置校验：配置缺失尽早暴露，而不是每次查询失败才报
+if not BASE_URL:
+    logger.warning("彩蛋 AI 配置缺失：BASE_URL 为空，AI 功能将不可用")
+if not API_KEY:
+    logger.warning("彩蛋 AI 配置缺失：API_KEY 为空，AI 功能将不可用")
+if not MODEL_THINK:
+    logger.warning("彩蛋 AI 配置缺失：MODEL_THINK 为空，彩蛋模糊匹配将不可用")
+if not MODEL_CHAT:
+    logger.warning("彩蛋 AI 配置缺失：MODEL_CHAT 为空，彩蛋对话回退将不可用")
+
+
+async def _chat_completion(
+    model: str,
+    messages: list[dict],
+    *,
+    max_tokens: int = 4500,
+    temperature: float = 0.3,
+) -> tuple[str | None, str | None]:
+    """调用 OpenAI 兼容 /chat/completions，返回 (content, error)。
+
+    content 为回复文本（成功时）；error 为 None 表示流程正常完成：
+      - 成功且有内容 -> (content, None)
+      - finish_reason 非 stop -> (None, None)（视为无内容但非错误）
+    error 非 None 表示发生错误，值为机器可读原因标识：
+      config / timeout / network / parse / http_<status> / unknown
+    """
+    # 配置不完整时快速失败，不发起请求
+    if not BASE_URL or not API_KEY or not model:
+        logger.error("AI 配置不完整，跳过请求（BASE_URL/API_KEY/model 存在空值）")
+        return None, "config"
+
+    url = f"{BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    try:
+        async with AI_SEMAPHORE:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=data) as response:
+                    if response.status != 200:
+                        body = (await response.text())[:200]
+                        logger.error(f"AI API 返回 HTTP {response.status}: {body}")
+                        return None, f"http_{response.status}"
+
+                    response_json = await response.json()
+                    choice = response_json["choices"][0]
+
+                    if choice["finish_reason"] != "stop":
+                        logger.warning(f"AI API finish_reason={choice['finish_reason']!r}，视为无内容")
+                        return None, None
+
+                    return choice["message"]["content"].strip(), None
+    except asyncio.TimeoutError:
+        logger.error(f"AI 请求超时（>{REQUEST_TIMEOUT}s）")
+        return None, "timeout"
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+        logger.error(f"AI 响应解析失败: {type(e).__name__}: {e}")
+        return None, "parse"
+    except aiohttp.ClientError as e:
+        logger.error(f"AI 网络错误: {e!r}")
+        return None, "network"
+    except Exception as e:
+        logger.error(f"AI 未预期错误: {type(e).__name__}: {e}")
+        return None, "unknown"
+
+
+async def ai_match(message: str, keywords: dict[str, list[str]]) -> tuple[list[str], str | None]:
+    """AI 模糊匹配彩蛋关键词，返回 (关键词列表, 错误原因)。
+
+    错误原因为 None 表示流程正常完成（此时关键词列表可能为空，表示无匹配）；
+    非 None 表示发生错误（config / timeout / network / parse / http_<status> / unknown）。
+    """
+    keywords_list = [f"{key}: {', '.join(aliases)}" for key, aliases in keywords.items()]
+    keywords_info = "\n".join(keywords_list)
+
+    system_prompt = f"""你是一个彩蛋关键词匹配助手。
+任务：根据用户输入快速返回所有可能匹配的关键词（只返回关键词本身，不要返回任何别名），如果用户的输入与下列彩蛋主题（迪士尼角色、教师人物、AI 模型、学校、组合等）毫无关系则直接返回NONE
+方法：在第一次浏览关键词的过程中对每个关键词进行匹配，例如：'LinaBell: 玲娜贝儿, 贝贝 - 不相关，...'，不要思考太多，不需要重新检查，浏览过后直接输出结果。规则：用户的输入与关键词的任意一个别名相关即认为匹配，多个用逗号分隔，无匹配返回NONE
+
+关键词及其别名的列表如下：
+{keywords_info}"""
+
+    result, error = await _chat_completion(
+        MODEL_THINK,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message},
+        ],
+        max_tokens=4500,
+        temperature=0.3,
+    )
+    if error:
+        return [], error
+    if not result or result == "NONE":
+        return [], None
+    return [k.strip() for k in result.split(",") if k.strip()], None
+
+
+async def ai_chat(user_text: str) -> tuple[str | None, str | None]:
+    """彩蛋对话回退：用预设系统提示词 + 用户文本生成回复。
+
+    返回 (回复文本, 错误原因)。错误原因语义同 _chat_completion。
+    """
+    result, error = await _chat_completion(
+        MODEL_CHAT,
+        [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=2000,
+        temperature=0.8,
+    )
+    if error:
+        return None, error
+    return result, None
