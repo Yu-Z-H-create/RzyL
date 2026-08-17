@@ -21,15 +21,48 @@ DEFAULT_CHAT_PROMPT = (
 )
 CHAT_SYSTEM_PROMPT = getattr(config, "easter_egg_chat_prompt", "") or DEFAULT_CHAT_PROMPT
 
-AI_SEMAPHORE = asyncio.Semaphore(8)
-# 请求超时（秒）：推理模型（reasoner）生成慢，60 秒常超时。
-# 可通过 AI_TIMEOUT 覆盖（如 AI_TIMEOUT=150），默认 120 秒。
+# 每个插件的 AI 并发上限：默认 5（可 AI_CONCURRENCY 覆盖），过高会冲击 API 链路、过低会排队拖慢。
 try:
-    REQUEST_TIMEOUT = max(1, int(getattr(config, "ai_timeout", 120) or 120))
+    AI_CONCURRENCY = max(1, int(getattr(config, "ai_concurrency", 5) or 5))
 except (TypeError, ValueError):
-    REQUEST_TIMEOUT = 120
+    AI_CONCURRENCY = 5
+AI_SEMAPHORE = asyncio.Semaphore(AI_CONCURRENCY)
+
+# 分段时间配置（秒）：connect 为 TCP/TLS 建立连接阶段；sock_read 为两次收到数据的最大间隔
+#（容忍大模型流式生成的停顿）；total 为整个请求总时长上限，可用 AI_TIMEOUT 覆盖（默认 180）。
+try:
+    REQUEST_TIMEOUT = max(1, int(getattr(config, "ai_timeout", 180) or 180))
+except (TypeError, ValueError):
+    REQUEST_TIMEOUT = 180
+_AI_TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, connect=30, sock_read=120)
 
 logger = logging.getLogger(__name__)
+
+# 复用的长连接会话：每个请求不再重复 TCP/TLS 握手，是缓解 AI 超时/变慢的关键之一。
+_session: aiohttp.ClientSession | None = None
+
+
+def _build_session() -> aiohttp.ClientSession:
+    connector = aiohttp.TCPConnector(limit=AI_CONCURRENCY, ttl_dns_cache=300)
+    return aiohttp.ClientSession(timeout=_AI_TIMEOUT, connector=connector)
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = _build_session()
+    return _session
+
+
+async def _close_session() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+# 退出时关闭连接池，避免资源泄漏与告警
+nonebot.get_driver().on_shutdown(_close_session)
 
 # 启动期配置校验：配置缺失尽早暴露，而不是每次查询失败才报
 if not BASE_URL:
@@ -76,22 +109,21 @@ async def _chat_completion(
 
     try:
         async with AI_SEMAPHORE:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=data) as response:
-                    if response.status != 200:
-                        body = (await response.text())[:200]
-                        logger.error(f"AI API 返回 HTTP {response.status}: {body}")
-                        return None, f"http_{response.status}"
+            session = await _get_session()
+            async with session.post(url, headers=headers, json=data) as response:
+                if response.status != 200:
+                    body = (await response.text())[:200]
+                    logger.error(f"AI API 返回 HTTP {response.status}: {body}")
+                    return None, f"http_{response.status}"
 
-                    response_json = await response.json()
-                    choice = response_json["choices"][0]
+                response_json = await response.json()
+                choice = response_json["choices"][0]
 
-                    if choice["finish_reason"] != "stop":
-                        logger.warning(f"AI API finish_reason={choice['finish_reason']!r}，视为无内容")
-                        return None, None
+                if choice["finish_reason"] != "stop":
+                    logger.warning(f"AI API finish_reason={choice['finish_reason']!r}，视为无内容")
+                    return None, None
 
-                    return choice["message"]["content"].strip(), None
+                return choice["message"]["content"].strip(), None
     except asyncio.TimeoutError:
         logger.error(f"AI 请求超时（>{REQUEST_TIMEOUT}s）")
         return None, "timeout"
