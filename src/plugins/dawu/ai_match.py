@@ -21,7 +21,12 @@ headers = {
 }
 
 AI_SEMAPHORE = asyncio.Semaphore(8)
-REQUEST_TIMEOUT = 60  # 秒
+# 请求超时（秒）：推理模型（reasoner）生成慢，60 秒常超时。
+# 可通过 AI_TIMEOUT 覆盖（如 AI_TIMEOUT=150），默认 120 秒。
+try:
+    REQUEST_TIMEOUT = max(1, int(getattr(config, 'ai_timeout', 120) or 120))
+except (TypeError, ValueError):
+    REQUEST_TIMEOUT = 120
 
 logger = logging.getLogger(__name__)
 
