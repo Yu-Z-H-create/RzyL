@@ -45,7 +45,7 @@ def load_categories() -> dict[str, Category]:
 
 
 def load_entities() -> dict[str, Entity]:
-    """加载个体，并过滤掉因类关闭而不可见的类内个体。
+    """加载个体，并过滤掉所有不可见的个体。
 
     可见性规则：
       - 顶层个体 -> 看自身 enabled；
@@ -58,6 +58,8 @@ def load_entities() -> dict[str, Entity]:
         category = spec.get("category")
         if category is not None and not categories.get(category, True):
             continue  # 类关闭 -> 该类个体完全不可见
+        if category is None and not spec.get("enabled", True):
+            continue  # 顶层个体自身关闭 -> 不可见
         entities[key] = Entity(
             key=key,
             mode=spec["mode"],
