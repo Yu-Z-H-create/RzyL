@@ -1,0 +1,28 @@
+{
+    "//说明": "这是彩蛋关键词配置的示例模板，仅供了解结构。实际配置请复制为同一目录下的 keywords.json 后自行填写（keywords.json 已被 .gitignore 忽略、不参与版本控制）。",
+
+    "categories": {
+        "factor":  { "display": "人物", "enabled": false },
+        "LLM":     { "display": "AI 拟人", "enabled": true },
+        "Origin":  { "display": "达菲朋友们", "enabled": false }
+    },
+
+    "entities": {
+        "示例教师":      { "category": "factor", "mode": "file", "aliases": ["示例教师"] },
+        "TeacherDir":    { "category": "factor", "mode": "dir",  "aliases": ["某个多图人物"] },
+
+        "GLM":     { "category": "LLM", "mode": "file", "aliases": ["GLM", "智谱"] },
+        "Qwen":    { "category": "LLM", "mode": "file", "aliases": ["Qwen", "千问"] },
+        "Deepseek":{ "category": "LLM", "mode": "dir",  "aliases": ["DeepSeek", "深度求索"] },
+
+        "LinaBell": { "category": "Origin", "mode": "file", "aliases": ["玲娜贝儿", "贝贝"] },
+        "Duffy":    { "category": "Origin", "mode": "file", "aliases": ["达菲"] },
+
+        "顶层示例A": { "mode": "file", "aliases": ["顶层A"], "enabled": true },
+        "顶层示例B": { "mode": "dir",  "aliases": ["顶层B"], "enabled": false }
+    },
+
+    "compounds": {
+        "示例组合": { "aliases": ["四大善人", "四善"], "targets": ["教师A", "教师B"] }
+    }
+}
